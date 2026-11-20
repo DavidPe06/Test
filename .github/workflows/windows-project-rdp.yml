@@ -106,9 +106,19 @@ jobs:
             try {
               [IO.File]::WriteAllText($keyFile, $authKey)
               $authKey = $null
-              & $tailscale up "--auth-key=file:$keyFile" --accept-dns=false --accept-routes=false "--hostname=rdp-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" --timeout=90s *> $null
+              $registration = @(& $tailscale up "--auth-key=file:$keyFile" --accept-dns=false --accept-routes=false "--hostname=rdp-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" --timeout=90s 2>&1)
               if ($LASTEXITCODE -ne 0) {
-                throw 'Tailscale registration failed. Check the key, device approval and tailnet policy.'
+                $reason = $registration -join ' '
+                if ($reason -match 'already (been )?used|expired|invalid (auth )?key|invalid key|key not found|key does not exist') {
+                  throw 'Tailscale rejected the auth key as invalid, expired or already used.'
+                }
+                if ($reason -match 'approval|not authorized|denied') {
+                  throw 'Tailscale denied registration or requires device approval.'
+                }
+                if ($reason -match 'timed?\s*out|deadline exceeded') {
+                  throw 'Tailscale registration timed out.'
+                }
+                throw "Tailscale registration failed with exit code $LASTEXITCODE."
               }
               $connected = $true
             } finally {
