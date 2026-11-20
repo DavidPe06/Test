@@ -51,22 +51,26 @@ jobs:
               $parsed.GetAddressBytes()[1] -in (64..127)
           }
 
-          function ConvertTo-IPv4String([uint32]$Address) {
-            $bytes = [BitConverter]::GetBytes($Address)
-            [Array]::Reverse($bytes)
-            return [Net.IPAddress]::new($bytes).ToString()
+          function Test-RdpPort([string]$Port) {
+            if ($Port -in ('Any', '3389')) { return $true }
+            if ($Port -match '^(\d+)-(\d+)$') {
+              return [int]$Matches[1] -le 3389 -and [int]$Matches[2] -ge 3389
+            }
+            return $false
           }
 
-          function Get-OtherAddresses([string]$AllowedAddress) {
-            # The hosted Windows x64 runner is little-endian.
-            $bytes = [Net.IPAddress]::Parse($AllowedAddress).GetAddressBytes()
-            [Array]::Reverse($bytes)
-            $value = [BitConverter]::ToUInt32($bytes, 0)
-            return @(
-              "0.0.0.0-$(ConvertTo-IPv4String ($value - 1))"
-              "$(ConvertTo-IPv4String ($value + 1))-255.255.255.255"
-              '::/0'
-            )
+          function Get-RdpInboundAllows {
+            $rules = Get-NetFirewallRule -PolicyStore ActiveStore -Direction Inbound -Enabled True -Action Allow
+            foreach ($rule in $rules) {
+              $port = $rule | Get-NetFirewallPortFilter
+              if ($port.Protocol -notin ('Any', 'TCP', '6')) { continue }
+              if (-not ($port.LocalPort | Where-Object { Test-RdpPort $_ })) { continue }
+              $service = ($rule | Get-NetFirewallServiceFilter).Service
+              if ($service -and $service -notin ('Any', 'TermService')) { continue }
+              $program = ($rule | Get-NetFirewallApplicationFilter).Program
+              if ($program -and $program -notin ('Any', 'System') -and $program -notmatch '(^|[\\/])svchost\.exe$') { continue }
+              $rule
+            }
           }
 
           if (-not (Test-TailscaleIPv4 $env:CLIENT_IPV4)) {
@@ -103,6 +107,26 @@ jobs:
               throw "Tailscale installation failed with MSI code $($installer.ExitCode)."
             }
 
+            Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled True -DefaultInboundAction Block
+            $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore)
+            if ($profiles.Count -ne 3 -or ($profiles | Where-Object { $_.Enabled -ne 'True' -or $_.DefaultInboundAction -ne 'Block' })) {
+              throw 'The effective Windows firewall policy does not block inbound connections by default.'
+            }
+            foreach ($existing in @(Get-RdpInboundAllows)) {
+              if ($existing.PolicyStoreSourceType -ne 'Local') {
+                throw 'An existing non-local firewall rule allows RDP and cannot be disabled safely.'
+              }
+              Disable-NetFirewallRule -Name $existing.Name -PolicyStore PersistentStore
+            }
+            if (@(Get-RdpInboundAllows).Count) {
+              throw 'An existing inbound rule still allows RDP.'
+            }
+
+            $user = New-LocalUser -Name 'rdp-dev' -Password $password -Description 'Temporary project RDP test'
+            Add-LocalGroupMember -SID ([Security.Principal.SecurityIdentifier]::new('S-1-5-32-555')) -Member $user
+            & icacls.exe (Join-Path $env:GITHUB_WORKSPACE 'project') /grant ('*{0}:(OI)(CI)M' -f $user.SID.Value) *> $null
+            if ($LASTEXITCODE -ne 0) { throw 'Unable to grant the temporary user access to the project checkout.' }
+
             try {
               [IO.File]::WriteAllText($keyFile, $authKey)
               $authKey = $null
@@ -135,23 +159,9 @@ jobs:
               throw 'The runner IPv4 address could not be mapped to the Tailscale adapter.'
             }
 
-            Set-NetFirewallProfile -Profile Domain, Private, Public -Enabled True -DefaultInboundAction Block
-            $profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore)
-            if ($profiles.Count -ne 3 -or ($profiles | Where-Object { $_.Enabled -ne 'True' -or $_.DefaultInboundAction -ne 'Block' })) {
-              throw 'The effective Windows firewall policy does not block inbound connections by default.'
-            }
-            $bypassRules = Get-NetFirewallRule -PolicyStore ActiveStore -Direction Inbound -Enabled True -Action Allow |
-              Get-NetFirewallSecurityFilter | Where-Object OverrideBlockRules -eq True
-            if ($bypassRules) {
-              throw 'The runner has a firewall rule that can override explicit blocks.'
-            }
-
-            # Explicit blocks take precedence over broad allow rules already present on the image.
-            $blockRules = @('ProjectRdpOtherDestinations', 'ProjectRdpOtherClients', 'ProjectRdpBlockUdp')
+            $blockRules = @('ProjectRdpBlockUdp')
             $inbound = @{ Direction = 'Inbound'; LocalPort = 3389; Profile = 'Any' }
-            New-NetFirewallRule @inbound -Name $blockRules[0] -DisplayName $blockRules[0] -Action Block -Protocol TCP -LocalAddress (Get-OtherAddresses $serverIPv4) | Out-Null
-            New-NetFirewallRule @inbound -Name $blockRules[1] -DisplayName $blockRules[1] -Action Block -Protocol TCP -RemoteAddress (Get-OtherAddresses $env:CLIENT_IPV4) | Out-Null
-            New-NetFirewallRule @inbound -Name $blockRules[2] -DisplayName $blockRules[2] -Action Block -Protocol UDP | Out-Null
+            New-NetFirewallRule @inbound -Name $blockRules[0] -DisplayName $blockRules[0] -Action Block -Protocol UDP | Out-Null
             $otherInterfaces = @(Get-NetAdapter | Where-Object ifIndex -ne $adapter[0].InterfaceIndex | Select-Object -ExpandProperty Name)
             if ($otherInterfaces.Count) {
               $blockRules += 'ProjectRdpOtherInterfaces'
@@ -162,11 +172,9 @@ jobs:
             if ($effectiveRules.Count -ne ($blockRules.Count + 1) -or ($effectiveRules | Where-Object Enabled -ne True)) {
               throw 'The intended firewall rules are not all enabled in the effective policy.'
             }
-
-            $user = New-LocalUser -Name 'rdp-dev' -Password $password -Description 'Temporary project RDP test'
-            Add-LocalGroupMember -SID ([Security.Principal.SecurityIdentifier]::new('S-1-5-32-555')) -Member $user
-            & icacls.exe (Join-Path $env:GITHUB_WORKSPACE 'project') /grant ('*{0}:(OI)(CI)M' -f $user.SID.Value) *> $null
-            if ($LASTEXITCODE -ne 0) { throw 'Unable to grant the temporary user access to the project checkout.' }
+            if (@(Get-RdpInboundAllows | Where-Object Name -ne $allowRule).Count) {
+              throw 'An unexpected inbound rule allows RDP.'
+            }
 
             $listenerSettings = Join-Path $rdpSettings 'WinStations\RDP-Tcp'
             Set-ItemProperty $listenerSettings -Name PortNumber -Value 3389
