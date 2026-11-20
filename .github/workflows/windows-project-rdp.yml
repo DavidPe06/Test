@@ -115,8 +115,9 @@ jobs:
               Remove-Item -LiteralPath $keyFile -Force -ErrorAction SilentlyContinue
             }
 
-            $serverIPv4 = [string](& $tailscale ip -4 2>$null | Select-Object -First 1)
-            if ($LASTEXITCODE -ne 0 -or -not (Test-TailscaleIPv4 $serverIPv4)) {
+            $assignedAddresses = @(& $tailscale ip -4 2>$null)
+            $serverIPv4 = [string]$assignedAddresses[0]
+            if ($LASTEXITCODE -ne 0 -or $assignedAddresses.Count -ne 1 -or -not (Test-TailscaleIPv4 $serverIPv4)) {
               throw 'The runner has no Tailscale IPv4 address.'
             }
             $adapter = @(Get-NetIPAddress -AddressFamily IPv4 -IPAddress $serverIPv4)
