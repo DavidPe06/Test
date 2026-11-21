@@ -139,7 +139,8 @@ jobs:
             New-NetFirewallRule @inbound -Name $tcpGuard -DisplayName $tcpGuard -Action Block -Protocol TCP | Out-Null
             New-NetFirewallRule @inbound -Name $udpBlock -DisplayName $udpBlock -Action Block -Protocol UDP | Out-Null
             New-NetFirewallRule @inbound -Name $allowRule -DisplayName $allowRule -Enabled False -Action Allow -Protocol TCP -LocalAddress 127.0.0.1 -RemoteAddress $env:CLIENT_IPV4 -Service TermService | Out-Null
-            $guards = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name $tcpGuard, $udpBlock -Enabled True -Action Block)
+            $guards = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name $tcpGuard, $udpBlock |
+              Where-Object { $_.Enabled -eq 'True' -and $_.Action -eq 'Block' -and $_.Direction -eq 'Inbound' })
             if ($guards.Count -ne 2) { throw 'The effective firewall does not block RDP during setup.' }
 
             $listenerSettings = Join-Path $rdpSettings 'WinStations\RDP-Tcp'
@@ -194,7 +195,10 @@ jobs:
             }
 
             Set-NetFirewallRule -PolicyStore PersistentStore -Name $allowRule -LocalAddress $serverIPv4 -Enabled True
-            $effective = Get-NetFirewallRule -PolicyStore ActiveStore -Name $allowRule -Direction Inbound -Action Allow -Enabled True
+            $effective = Get-NetFirewallRule -PolicyStore ActiveStore -Name $allowRule
+            if ($effective.Direction -ne 'Inbound' -or $effective.Action -ne 'Allow' -or $effective.Enabled -ne 'True') {
+              throw 'The scoped RDP firewall rule is not active in Windows.'
+            }
             $scope = $effective | Get-NetFirewallAddressFilter
             $localScope = (@($scope.LocalAddress) -join ',') -replace '/32$'
             $remoteScope = (@($scope.RemoteAddress) -join ',') -replace '/32$'
