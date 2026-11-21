@@ -78,6 +78,16 @@ jobs:
             }
           }
 
+          function Disable-OtherRdpAllows([string]$AllowedRuleName) {
+            foreach ($existing in @(Get-RdpInboundAllows | Where-Object Name -ne $AllowedRuleName)) {
+              if ($existing.PolicyStoreSourceType -ne 'Local') {
+                throw 'An existing non-local firewall rule allows RDP and cannot be disabled safely.'
+              }
+              Disable-NetFirewallRule -Name $existing.Name -PolicyStore PersistentStore
+              Write-Host "Disabled an overlapping inbound firewall rule: $($existing.DisplayName)"
+            }
+          }
+
           if (-not (Test-TailscaleIPv4 $env:CLIENT_IPV4)) {
             throw 'client_ipv4 must be the Tailscale IPv4 address of the client.'
           }
@@ -120,12 +130,7 @@ jobs:
             if ($profiles.Count -ne 3 -or ($profiles | Where-Object { $_.Enabled -ne 'True' -or $_.DefaultInboundAction -ne 'Block' })) {
               throw 'The effective Windows firewall policy does not block inbound connections by default.'
             }
-            foreach ($existing in @(Get-RdpInboundAllows)) {
-              if ($existing.PolicyStoreSourceType -ne 'Local') {
-                throw 'An existing non-local firewall rule allows RDP and cannot be disabled safely.'
-              }
-              Disable-NetFirewallRule -Name $existing.Name -PolicyStore PersistentStore
-            }
+            Disable-OtherRdpAllows
             if (@(Get-RdpInboundAllows).Count) {
               throw 'An existing inbound rule still allows RDP.'
             }
@@ -160,7 +165,12 @@ jobs:
             if (@(Get-RdpInboundAllows).Count) { throw 'Starting the listener enabled an unexpected inbound rule.' }
 
             $serverIPv4 = '100.64.0.1'
-            if (-not $preflightOnly) {
+            if ($preflightOnly) {
+              if (Get-NetIPAddress -AddressFamily IPv4 -IPAddress $serverIPv4 -ErrorAction SilentlyContinue) {
+                throw 'The diagnostic firewall address is already in use.'
+              }
+              New-NetFirewallRule -Name 'ProjectRdpPreflightAutoAllow' -DisplayName 'Simulated Tailscale-In rule' -Direction Inbound -Action Allow -LocalAddress $serverIPv4 -Profile Any | Out-Null
+            } else {
               try {
                 [IO.File]::WriteAllText($keyFile, $authKey)
                 $authKey = $null
@@ -205,6 +215,9 @@ jobs:
             if ($localScope -ne $serverIPv4 -or $remoteScope -ne $env:CLIENT_IPV4) {
               throw 'The effective RDP firewall rule does not restrict both IPv4 endpoints.'
             }
+
+            # Tailscale adds inbound allow rules after the device connects.
+            Disable-OtherRdpAllows $allowRule
             $inboundAllows = @(Get-RdpInboundAllows)
             if ($inboundAllows.Count -ne 1 -or $inboundAllows[0].Name -ne $allowRule) {
               throw 'The firewall must have exactly one applicable inbound RDP rule.'
@@ -213,6 +226,9 @@ jobs:
             $computer = Get-CimInstance Win32_ComputerSystem
             Write-Host ('RAM {0:N2} GiB. Procesadores lógicos {1}.' -f ($computer.TotalPhysicalMemory / 1GB), $computer.NumberOfLogicalProcessors)
             if ($preflightOnly) {
+              if ((Get-NetFirewallRule -PolicyStore ActiveStore -Name 'ProjectRdpPreflightAutoAllow').Enabled -ne 'False') {
+                throw 'The diagnostic could not disable the simulated Tailscale-In rule.'
+              }
               Write-Host 'Preflight passed: TCP 3389 listener verified with the inbound block still in place.'
               return
             }
