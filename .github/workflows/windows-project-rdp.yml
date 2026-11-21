@@ -7,6 +7,10 @@ on:
         description: Tailscale IPv4 address of the authorized RDP client
         required: true
         type: string
+      preflight_only:
+        description: Verify the listener and firewall without registering a Tailscale device
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -37,7 +41,8 @@ jobs:
       - name: Open RDP to the authorized Tailscale device
         env:
           CLIENT_IPV4: ${{ inputs.client_ipv4 }}
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          PREFLIGHT_ONLY: ${{ inputs.preflight_only }}
+          TAILSCALE_AUTH_KEY: ${{ !inputs.preflight_only && secrets.TAILSCALE_AUTH_KEY || '' }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           $ErrorActionPreference = 'Stop'
@@ -76,7 +81,8 @@ jobs:
           if (-not (Test-TailscaleIPv4 $env:CLIENT_IPV4)) {
             throw 'client_ipv4 must be the Tailscale IPv4 address of the client.'
           }
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+          $preflightOnly = $env:PREFLIGHT_ONLY -eq 'true'
+          if (-not $preflightOnly -and [string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
             throw 'The TAILSCALE_AUTH_KEY secret is required.'
           }
           if ($env:RDP_PASSWORD.Length -notin (12..127) -or $env:RDP_PASSWORD -match '[\r\n]') {
@@ -85,11 +91,13 @@ jobs:
 
           $authKey = $env:TAILSCALE_AUTH_KEY
           $password = ConvertTo-SecureString $env:RDP_PASSWORD -AsPlainText -Force
-          Remove-Item Env:\TAILSCALE_AUTH_KEY, Env:\RDP_PASSWORD
+          Remove-Item Env:\TAILSCALE_AUTH_KEY, Env:\RDP_PASSWORD -ErrorAction SilentlyContinue
           $tailscale = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
           $keyFile = Join-Path $env:RUNNER_TEMP ("tailscale-{0}.key" -f [guid]::NewGuid())
           $rdpSettings = 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server'
           $allowRule = 'ProjectRdpAuthorizedClient'
+          $tcpGuard = 'ProjectRdpBlockTcpUntilReady'
+          $udpBlock = 'ProjectRdpBlockUdp'
           $user = $null
           $connected = $false
 
@@ -127,54 +135,12 @@ jobs:
             & icacls.exe (Join-Path $env:GITHUB_WORKSPACE 'project') /grant ('*{0}:(OI)(CI)M' -f $user.SID.Value) *> $null
             if ($LASTEXITCODE -ne 0) { throw 'Unable to grant the temporary user access to the project checkout.' }
 
-            try {
-              [IO.File]::WriteAllText($keyFile, $authKey)
-              $authKey = $null
-              $registration = @(& $tailscale up "--auth-key=file:$keyFile" --accept-dns=false --accept-routes=false "--hostname=rdp-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" --timeout=90s 2>&1)
-              if ($LASTEXITCODE -ne 0) {
-                $reason = $registration -join ' '
-                if ($reason -match 'already (been )?used|expired|invalid (auth )?key|invalid key|key not found|key does not exist') {
-                  throw 'Tailscale rejected the auth key as invalid, expired or already used.'
-                }
-                if ($reason -match 'approval|not authorized|denied') {
-                  throw 'Tailscale denied registration or requires device approval.'
-                }
-                if ($reason -match 'timed?\s*out|deadline exceeded') {
-                  throw 'Tailscale registration timed out.'
-                }
-                throw "Tailscale registration failed with exit code $LASTEXITCODE."
-              }
-              $connected = $true
-            } finally {
-              Remove-Item -LiteralPath $keyFile -Force -ErrorAction SilentlyContinue
-            }
-
-            $assignedAddresses = @(& $tailscale ip -4 2>$null)
-            $serverIPv4 = [string]$assignedAddresses[0]
-            if ($LASTEXITCODE -ne 0 -or $assignedAddresses.Count -ne 1 -or -not (Test-TailscaleIPv4 $serverIPv4)) {
-              throw 'The runner has no Tailscale IPv4 address.'
-            }
-            $adapter = @(Get-NetIPAddress -AddressFamily IPv4 -IPAddress $serverIPv4)
-            if ($adapter.Count -ne 1 -or $adapter[0].InterfaceAlias -notlike '*Tailscale*') {
-              throw 'The runner IPv4 address could not be mapped to the Tailscale adapter.'
-            }
-
-            $blockRules = @('ProjectRdpBlockUdp')
             $inbound = @{ Direction = 'Inbound'; LocalPort = 3389; Profile = 'Any' }
-            New-NetFirewallRule @inbound -Name $blockRules[0] -DisplayName $blockRules[0] -Action Block -Protocol UDP | Out-Null
-            $otherInterfaces = @(Get-NetAdapter | Where-Object ifIndex -ne $adapter[0].InterfaceIndex | Select-Object -ExpandProperty Name)
-            if ($otherInterfaces.Count) {
-              $blockRules += 'ProjectRdpOtherInterfaces'
-              New-NetFirewallRule @inbound -Name 'ProjectRdpOtherInterfaces' -DisplayName 'ProjectRdpOtherInterfaces' -Action Block -Protocol TCP -InterfaceAlias $otherInterfaces | Out-Null
-            }
-            New-NetFirewallRule @inbound -Name $allowRule -DisplayName $allowRule -Action Allow -Protocol TCP -InterfaceAlias $adapter[0].InterfaceAlias -LocalAddress $serverIPv4 -RemoteAddress $env:CLIENT_IPV4 -Service TermService | Out-Null
-            $effectiveRules = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name ($blockRules + $allowRule))
-            if ($effectiveRules.Count -ne ($blockRules.Count + 1) -or ($effectiveRules | Where-Object Enabled -ne True)) {
-              throw 'The intended firewall rules are not all enabled in the effective policy.'
-            }
-            if (@(Get-RdpInboundAllows | Where-Object Name -ne $allowRule).Count) {
-              throw 'An unexpected inbound rule allows RDP.'
-            }
+            New-NetFirewallRule @inbound -Name $tcpGuard -DisplayName $tcpGuard -Action Block -Protocol TCP | Out-Null
+            New-NetFirewallRule @inbound -Name $udpBlock -DisplayName $udpBlock -Action Block -Protocol UDP | Out-Null
+            New-NetFirewallRule @inbound -Name $allowRule -DisplayName $allowRule -Enabled False -Action Allow -Protocol TCP -LocalAddress 127.0.0.1 -RemoteAddress $env:CLIENT_IPV4 -Service TermService | Out-Null
+            $guards = @(Get-NetFirewallRule -PolicyStore ActiveStore -Name $tcpGuard, $udpBlock -Enabled True -Action Block)
+            if ($guards.Count -ne 2) { throw 'The effective firewall does not block RDP during setup.' }
 
             $listenerSettings = Join-Path $rdpSettings 'WinStations\RDP-Tcp'
             Set-ItemProperty $listenerSettings -Name PortNumber -Value 3389
@@ -190,10 +156,68 @@ jobs:
               Start-Sleep -Seconds 2
             }
             if (-not $listener) { throw 'The RDP service did not open TCP 3389.' }
+            if (@(Get-RdpInboundAllows).Count) { throw 'Starting the listener enabled an unexpected inbound rule.' }
+
+            $serverIPv4 = '100.64.0.1'
+            if (-not $preflightOnly) {
+              try {
+                [IO.File]::WriteAllText($keyFile, $authKey)
+                $authKey = $null
+                $registration = @(& $tailscale up "--auth-key=file:$keyFile" --accept-dns=false --accept-routes=false "--hostname=rdp-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" --timeout=90s 2>&1)
+                if ($LASTEXITCODE -ne 0) {
+                  $reason = $registration -join ' '
+                  if ($reason -match 'already (been )?used|expired|invalid (auth )?key|invalid key|key not found|key does not exist') {
+                    throw 'Tailscale rejected the auth key as invalid, expired or already used.'
+                  }
+                  if ($reason -match 'approval|not authorized|denied') {
+                    throw 'Tailscale denied registration or requires device approval.'
+                  }
+                  if ($reason -match 'timed?\s*out|deadline exceeded') {
+                    throw 'Tailscale registration timed out.'
+                  }
+                  throw "Tailscale registration failed with exit code $LASTEXITCODE."
+                }
+                $connected = $true
+              } finally {
+                Remove-Item -LiteralPath $keyFile -Force -ErrorAction SilentlyContinue
+              }
+
+              $assignedAddresses = @(& $tailscale ip -4 2>$null)
+              $serverIPv4 = [string]$assignedAddresses[0]
+              if ($LASTEXITCODE -ne 0 -or $assignedAddresses.Count -ne 1 -or -not (Test-TailscaleIPv4 $serverIPv4)) {
+                throw 'The runner has no Tailscale IPv4 address.'
+              }
+              $adapter = @(Get-NetIPAddress -AddressFamily IPv4 -IPAddress $serverIPv4)
+              if ($adapter.Count -ne 1 -or $adapter[0].InterfaceAlias -notlike '*Tailscale*') {
+                throw 'The runner IPv4 address could not be mapped to the Tailscale adapter.'
+              }
+            }
+
+            Set-NetFirewallRule -PolicyStore PersistentStore -Name $allowRule -LocalAddress $serverIPv4 -Enabled True
+            $effective = Get-NetFirewallRule -PolicyStore ActiveStore -Name $allowRule -Direction Inbound -Action Allow -Enabled True
+            $scope = $effective | Get-NetFirewallAddressFilter
+            $localScope = (@($scope.LocalAddress) -join ',') -replace '/32$'
+            $remoteScope = (@($scope.RemoteAddress) -join ',') -replace '/32$'
+            if ($localScope -ne $serverIPv4 -or $remoteScope -ne $env:CLIENT_IPV4) {
+              throw 'The effective RDP firewall rule does not restrict both IPv4 endpoints.'
+            }
+            $inboundAllows = @(Get-RdpInboundAllows)
+            if ($inboundAllows.Count -ne 1 -or $inboundAllows[0].Name -ne $allowRule) {
+              throw 'The firewall must have exactly one applicable inbound RDP rule.'
+            }
 
             $computer = Get-CimInstance Win32_ComputerSystem
-            Write-Host "RDP listo. Dirección $serverIPv4. Usuario .\rdp-dev. Proyecto en $env:GITHUB_WORKSPACE\project."
             Write-Host ('RAM {0:N2} GiB. Procesadores lógicos {1}.' -f ($computer.TotalPhysicalMemory / 1GB), $computer.NumberOfLogicalProcessors)
+            if ($preflightOnly) {
+              Write-Host 'Preflight passed: TCP 3389 listener verified with the inbound block still in place.'
+              return
+            }
+
+            Disable-NetFirewallRule -PolicyStore PersistentStore -Name $tcpGuard
+            if ((Get-NetFirewallRule -PolicyStore ActiveStore -Name $tcpGuard).Enabled -ne 'False') {
+              throw 'The temporary setup guard could not be disabled.'
+            }
+            Write-Host "RDP listo. Dirección $serverIPv4. Usuario .\rdp-dev. Proyecto en $env:GITHUB_WORKSPACE\project."
             $deadline = [DateTimeOffset]::Parse($env:RDP_END_AT, [cultureinfo]::InvariantCulture)
             while ([DateTimeOffset]::UtcNow -lt $deadline) {
               Start-Sleep -Seconds 5
