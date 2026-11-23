@@ -137,6 +137,11 @@ jobs:
 
             $user = New-LocalUser -Name 'rdp-dev' -Password $password -Description 'Temporary project RDP test'
             Add-LocalGroupMember -SID ([Security.Principal.SecurityIdentifier]::new('S-1-5-32-555')) -Member $user
+            $administratorGroup = [Security.Principal.SecurityIdentifier]::new('S-1-5-32-544')
+            Add-LocalGroupMember -SID $administratorGroup -Member $user
+            $administrator = Get-LocalGroupMember -SID $administratorGroup | Where-Object { $_.SID -eq $user.SID }
+            if (-not $administrator) { throw 'The temporary RDP user is not a local administrator.' }
+            Write-Host 'The temporary RDP user is a local administrator.'
             & icacls.exe (Join-Path $env:GITHUB_WORKSPACE 'project') /grant ('*{0}:(OI)(CI)M' -f $user.SID.Value) *> $null
             if ($LASTEXITCODE -ne 0) { throw 'Unable to grant the temporary user access to the project checkout.' }
 
