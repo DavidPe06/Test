@@ -11,6 +11,13 @@ on:
         description: Verify the listener and firewall without registering a Tailscale device
         default: false
         type: boolean
+      duration_minutes:
+        description: RDP session duration in minutes
+        default: '30'
+        type: choice
+        options:
+          - '30'
+          - '120'
 
 permissions:
   contents: read
@@ -22,13 +29,14 @@ concurrency:
 jobs:
   windows:
     runs-on: windows-2022
-    timeout-minutes: 30
+    timeout-minutes: ${{ inputs.duration_minutes == '120' && 130 || 30 }}
     defaults:
       run:
         shell: pwsh
 
     steps:
       - name: Set cleanup deadline
+        if: inputs.duration_minutes != '120'
         run: |
           "RDP_END_AT=$([DateTimeOffset]::UtcNow.AddMinutes(28).ToString('o'))" >> $env:GITHUB_ENV
 
@@ -42,6 +50,7 @@ jobs:
         env:
           CLIENT_IPV4: ${{ inputs.client_ipv4 }}
           PREFLIGHT_ONLY: ${{ inputs.preflight_only }}
+          SESSION_MINUTES: ${{ inputs.duration_minutes }}
           TAILSCALE_AUTH_KEY: ${{ !inputs.preflight_only && secrets.TAILSCALE_AUTH_KEY || '' }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
@@ -243,7 +252,12 @@ jobs:
               throw 'The temporary setup guard could not be disabled.'
             }
             Write-Host "RDP listo. Dirección $serverIPv4. Usuario .\rdp-dev. Proyecto en $env:GITHUB_WORKSPACE\project."
-            $deadline = [DateTimeOffset]::Parse($env:RDP_END_AT, [cultureinfo]::InvariantCulture)
+            if ($env:SESSION_MINUTES -eq '120') {
+              $deadline = [DateTimeOffset]::UtcNow.AddMinutes(120)
+            } else {
+              $deadline = [DateTimeOffset]::Parse($env:RDP_END_AT, [cultureinfo]::InvariantCulture)
+            }
+            Write-Host ('RDP available until {0:u}.' -f $deadline)
             while ([DateTimeOffset]::UtcNow -lt $deadline) {
               Start-Sleep -Seconds 5
             }
